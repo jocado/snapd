@@ -120,30 +120,58 @@ func shouldCopySnap(target *Snap, model *asserts.Model, modelSnaps map[string]*a
 	return strutil.ListContains(oc.Snaps, target.SnapName().String())
 }
 
-func shouldCopyComponent(target Component, snapName string, model *asserts.Model, modelSnaps map[string]*asserts.ModelSnap, oc *OptionalContainers) bool {
-	if oc == nil {
-		return true
+// requiredByValidationSet reports whether compName is required, for
+// modelSnap, by any of the validation-sets in valsets. valsets may be nil
+// (e.g. on a dangerous-grade model, where this is never consulted).
+func requiredByValidationSet(valsets *snapasserts.ValidationSets, modelSnap *asserts.ModelSnap, compName string) (bool, error) {
+	if valsets == nil {
+		return false, nil
 	}
+	pres, err := valsets.Presence(modelSnap)
+	if err != nil {
+		return false, err
+	}
+	_, required := pres.RequiredComponents()[compName]
+	return required, nil
+}
+
+func shouldCopyComponent(target Component, snapName string, model *asserts.Model, modelSnaps map[string]*asserts.ModelSnap, valsets *snapasserts.ValidationSets, oc *OptionalContainers) (bool, error) {
+	if oc == nil {
+		return true, nil
+	}
+
+	componentName := target.CompSideInfo.Component.ComponentName
 
 	var componentInModel bool
 	modelSnap, ok := modelSnaps[snapName]
 	if ok {
-		if modelComp, ok := modelSnap.Components[target.CompSideInfo.Component.ComponentName]; ok {
+		if modelComp, ok := modelSnap.Components[componentName]; ok {
 			componentInModel = true
 			if modelComp.Presence == "required" {
-				return true
+				return true, nil
 			}
 		}
 	}
 
-	// if the component isn't in the model and the model isn't grade dangerous,
-	// then we shouldn't ever copy the component. this situation should only
-	// happen if someone has tampered with the seed.
+	// if the component isn't in the model and the model isn't grade
+	// dangerous, then we shouldn't copy the component unless an enforced
+	// validation-set requires it for this snap. any other way to end up
+	// here should only happen if someone has tampered with the seed.
 	if !componentInModel && model.Grade() != asserts.ModelDangerous {
-		return false
+		required := false
+		if ok {
+			var err error
+			required, err = requiredByValidationSet(valsets, modelSnap, componentName)
+			if err != nil {
+				return false, err
+			}
+		}
+		if !required {
+			return false, nil
+		}
 	}
 
-	return strutil.ListContains(oc.Components[snapName], target.CompSideInfo.Component.ComponentName)
+	return strutil.ListContains(oc.Components[snapName], componentName), nil
 }
 
 // OptionalContainers implements the Copier interface.
@@ -204,10 +232,16 @@ func (s *seed20) availableContainers() (map[string]bool, map[string]map[string]b
 	availableSnapSet, availableCompSets := s.availableAssertedContainers()
 
 	optsPath := filepath.Join(s.systemDir, "options.yaml")
-	if s.model.Grade() == asserts.ModelDangerous && osutil.FileExists(optsPath) {
+	if osutil.FileExists(optsPath) {
 		opts, err := internal.ReadOptions20(optsPath)
 		if err != nil {
 			return nil, nil, err
+		}
+
+		if s.model.Grade() != asserts.ModelDangerous {
+			if err := s.checkNonDangerousOptions(opts.Snaps); err != nil {
+				return nil, nil, err
+			}
 		}
 
 		for _, sn := range opts.Snaps {
@@ -330,6 +364,18 @@ func (s *seed20) Copy(seedDir string, opts CopyOptions, tm timings.Measurer) (er
 	auxInfo := make(map[string]*internal.AuxInfo20)
 	optSnaps := make([]*internal.Snap20, 0)
 
+	// only needed to decide whether a non-model component is legitimate
+	// to copy on a non-dangerous grade (see shouldCopyComponent); left
+	// nil for dangerous grade, where it's never consulted.
+	var valsets *snapasserts.ValidationSets
+	if s.model.Grade() != asserts.ModelDangerous {
+		var err error
+		valsets, err = s.validationSetsFromModel()
+		if err != nil {
+			return err
+		}
+	}
+
 	// copy the snaps and components that the seed needs
 	for _, sn := range s.snaps {
 		// if we're not copying the snap, then we also don't need to copy the
@@ -339,7 +385,7 @@ func (s *seed20) Copy(seedDir string, opts CopyOptions, tm timings.Measurer) (er
 		}
 
 		// optSnap might be nil if it shouldn't have an entry in options.yaml
-		as, optSnap, err := s.copySnapAndComponents(sn, destSeedDir, opts)
+		as, optSnap, err := s.copySnapAndComponents(sn, destSeedDir, opts, valsets)
 		if err != nil {
 			return err
 		}
@@ -397,7 +443,7 @@ func componentInModel(cref naming.ComponentRef, modelSnaps map[string]*asserts.M
 	return ok
 }
 
-func (s *seed20) copySnapAndComponents(sn *Snap, destSeedDir string, opts CopyOptions) ([]asserts.Assertion, *internal.Snap20, error) {
+func (s *seed20) copySnapAndComponents(sn *Snap, destSeedDir string, opts CopyOptions, valsets *snapasserts.ValidationSets) ([]asserts.Assertion, *internal.Snap20, error) {
 	destination := func(filename string, asserted, inModel bool) string {
 		if asserted && inModel {
 			return filepath.Join(destSeedDir, "snaps", filename)
@@ -461,7 +507,11 @@ func (s *seed20) copySnapAndComponents(sn *Snap, destSeedDir string, opts CopyOp
 	}
 
 	for _, comp := range sn.Components {
-		if !shouldCopyComponent(comp, sn.SnapName().String(), s.model, s.modelSnaps, opts.OptionalContainers) {
+		copyComp, err := shouldCopyComponent(comp, sn.SnapName().String(), s.model, s.modelSnaps, valsets, opts.OptionalContainers)
+		if err != nil {
+			return nil, nil, err
+		}
+		if !copyComp {
 			continue
 		}
 
@@ -757,10 +807,6 @@ func (s *seed20) UsesSnapdSnap() bool {
 }
 
 func (s *seed20) loadOptions() error {
-	if s.model.Grade() != asserts.ModelDangerous {
-		// options.yaml is not supported for grade > dangerous
-		return nil
-	}
 	optionsFn := filepath.Join(s.systemDir, "options.yaml")
 	if !osutil.FileExists(optionsFn) {
 		// missing
@@ -770,8 +816,126 @@ func (s *seed20) loadOptions() error {
 	if err != nil {
 		return err
 	}
+
+	if s.model.Grade() != asserts.ModelDangerous {
+		if err := s.checkNonDangerousOptions(options20.Snaps); err != nil {
+			return err
+		}
+	}
+
 	s.optSnaps = options20.Snaps
 	return nil
+}
+
+// checkNonDangerousOptions is the read-side counterpart of the write-side
+// grade check in seedwriter's tree20.writeMeta: on a model that isn't
+// dangerous grade, options.yaml is an unsigned file, so it isn't trusted
+// at face value. A channel override, an unasserted (local) snap, an
+// unasserted component, or an entirely non-model extra snap can only ever
+// come from a dangerous-only image-build-time override, so any of those
+// are rejected outright. A component absent from the model's own
+// declaration is allowed only if it's independently verified against the
+// (signed) validation-set assertions already stored in this seed to be
+// required by one of the model's enforced validation-sets -- exactly the
+// same check the writer performed when it allowed the component through
+// in the first place.
+func (s *seed20) checkNonDangerousOptions(optSnaps []*internal.Snap20) error {
+	var valsets *snapasserts.ValidationSets
+	for _, optSnap := range optSnaps {
+		if optSnap.Channel != "" {
+			return fmt.Errorf("system options.yaml has unexpected channel override for grade %s: snap %q", s.model.Grade(), optSnap.Name)
+		}
+		if optSnap.Unasserted != "" {
+			return fmt.Errorf("system options.yaml has unexpected unasserted snap for grade %s: snap %q", s.model.Grade(), optSnap.Name)
+		}
+
+		// checked unconditionally, even for an entry with no components:
+		// an entirely non-model snap entry (e.g. one seed writer would
+		// only ever produce via a dangerous-only extra-snap override)
+		// must be rejected regardless of what else it does or doesn't
+		// list, since it's about to be queued as an extra snap to load
+		// by LoadMeta's nextOptSnap(nil) merge.
+		modelSnap := s.modelSnaps[optSnap.Name.String()]
+		if modelSnap == nil {
+			return fmt.Errorf("system options.yaml has unexpected non-model snap for grade %s: snap %q", s.model.Grade(), optSnap.Name)
+		}
+
+		if len(optSnap.Components) == 0 {
+			continue
+		}
+
+		if valsets == nil {
+			var err error
+			valsets, err = s.validationSetsFromModel()
+			if err != nil {
+				return err
+			}
+		}
+
+		for _, comp := range optSnap.Components {
+			if comp.Unasserted != "" {
+				return fmt.Errorf("system options.yaml has unexpected unasserted component for grade %s: %s+%s", s.model.Grade(), optSnap.Name, comp.Name)
+			}
+			if _, ok := modelSnap.Components[comp.Name]; ok {
+				// declared by the model already; unexpected here but
+				// not a dangerous-only override either
+				continue
+			}
+			required, err := requiredByValidationSet(valsets, modelSnap, comp.Name)
+			if err != nil {
+				return err
+			}
+			if !required {
+				return fmt.Errorf("system options.yaml lists component %q for snap %q, which is neither declared by the model nor required by an enforced validation-set, unexpected for grade %s", comp.Name, optSnap.Name, s.model.Grade())
+			}
+		}
+	}
+	return nil
+}
+
+// validationSetsFromModel builds a snapasserts.ValidationSets from exactly
+// the validation-sets the model itself references in its
+// "validation-sets:" stanza, resolved against the assertions already
+// stored in this seed's database -- mirroring seedwriter.Writer's
+// validationSetAsserts(), which built the same set when the writer decided
+// to let a validation-set-only component through in the first place.
+//
+// This deliberately does NOT just fetch every ValidationSetType assertion
+// present in s.db: the db passed to LoadAssertions is not necessarily
+// scoped to this seed alone (e.g. first-boot seeding hands it the whole
+// device assertion database), so it can hold validation-set assertions
+// left over from elsewhere -- a prior remodel, a monitor-mode "snap
+// validate", a different account -- that this model doesn't reference at
+// all. Trusting any of those would let a component in that the model
+// never actually opted into enforcing.
+func (s *seed20) validationSetsFromModel() (*snapasserts.ValidationSets, error) {
+	valsets := snapasserts.NewValidationSets()
+	for _, vsm := range s.model.ValidationSets() {
+		atSeq := vsm.AtSequence()
+
+		var a asserts.Assertion
+		var err error
+		if atSeq.Sequence <= 0 {
+			var hdrs map[string]string
+			hdrs, err = asserts.HeadersFromSequenceKey(atSeq.Type, atSeq.SequenceKey)
+			if err == nil {
+				a, err = s.db.FindSequence(atSeq.Type, hdrs, -1, atSeq.Type.MaxSupportedFormat())
+			}
+		} else {
+			a, err = atSeq.Resolve(s.db.Find)
+		}
+		if err != nil {
+			return nil, fmt.Errorf("internal error: cannot resolve validation-set %q referenced by the model: %v", vsm.Name, err)
+		}
+
+		if err := valsets.Add(a.(*asserts.ValidationSet)); err != nil {
+			return nil, err
+		}
+	}
+	if err := valsets.Conflict(); err != nil {
+		return nil, err
+	}
+	return valsets, nil
 }
 
 func (s *seed20) nextOptSnap(modSnap *asserts.ModelSnap) (optSnap *internal.Snap20, done bool) {

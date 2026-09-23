@@ -5331,6 +5331,482 @@ func (s *seed20Suite) TestSeedWithComponentsInModelAndOptions(c *C) {
 	})
 }
 
+// TestSeedWithComponentRequiredByValidationSetOnlySecuredGrade demonstrates
+// the read side (and seed-copy side) of a component that the model itself
+// doesn't declare, but that an enforced validation-set requires, on a
+// secured-grade model. The seed is written with seedwriter's own support
+// for this (see writer.go's modelSnapToSeed and seed20.go's writeMeta),
+// then reloaded and copied through the ordinary reading APIs, to show that
+// options.yaml's grade restriction can be relaxed for this specific case
+// without trusting the file blindly: the component is independently
+// re-verified against the validation-set assertions already stored in the
+// seed, not just trusted because it's listed in options.yaml.
+func (s *seed20Suite) TestSeedWithComponentRequiredByValidationSetOnlySecuredGrade(c *C) {
+	s.makeSnap(c, "snapd", "")
+	s.makeSnap(c, "core20", "")
+	s.makeSnap(c, "pc-kernel=20", "")
+	s.makeSnap(c, "pc=20", "")
+
+	// component-test's snap.yaml declares comp1, comp2 and comp3; comp3 is
+	// unused by this test but MakeAssertedSnapWithComps requires a
+	// revision for every component the snap declares.
+	assertCompRevs := map[string]snap.Revision{
+		"comp1": snap.R(22),
+		"comp2": snap.R(33),
+		"comp3": snap.R(44),
+	}
+	s.MakeAssertedSnapWithComps(c,
+		seedtest.SampleSnapYaml["component-test"], nil,
+		snap.R(11), assertCompRevs, "canonical", s.StoreSigning.Database,
+	)
+
+	valSet, err := s.StoreSigning.Sign(asserts.ValidationSetType, map[string]any{
+		"type":         "validation-set",
+		"authority-id": "canonical",
+		"series":       "16",
+		"account-id":   "canonical",
+		"name":         "comps-set",
+		"sequence":     "1",
+		"snaps": []any{
+			map[string]any{
+				"name":     "component-test",
+				"id":       s.AssertedSnapID("component-test"),
+				"presence": "required",
+				"revision": "11",
+				"components": map[string]any{
+					"comp1": map[string]any{"presence": "required", "revision": "22"},
+					"comp2": map[string]any{"presence": "required", "revision": "33"},
+				},
+			},
+		},
+		"timestamp": time.Now().UTC().Format(time.RFC3339),
+	}, nil, "")
+	c.Assert(err, IsNil)
+	c.Assert(s.StoreSigning.Add(valSet), IsNil)
+
+	model := s.Brands.Model("my-brand", "my-model", map[string]any{
+		"display-name": "my model",
+		"architecture": "amd64",
+		"base":         "core20",
+		"grade":        "secured",
+		"snaps": []any{
+			map[string]any{
+				"name":            "pc-kernel",
+				"id":              s.AssertedSnapID("pc-kernel"),
+				"type":            "kernel",
+				"default-channel": "20",
+			},
+			map[string]any{
+				"name":            "pc",
+				"id":              s.AssertedSnapID("pc"),
+				"type":            "gadget",
+				"default-channel": "20",
+			},
+			map[string]any{
+				"name":     "component-test",
+				"id":       s.AssertedSnapID("component-test"),
+				"presence": "required",
+				// comp2 is intentionally absent here: the model does
+				// not know about it, only the validation-set does.
+				"components": map[string]any{
+					"comp1": "required",
+				},
+			},
+		},
+		"validation-sets": []any{
+			map[string]any{
+				"account-id": "canonical",
+				"name":       "comps-set",
+				"sequence":   "1",
+				"mode":       "enforce",
+			},
+		},
+	})
+	c.Assert(model.Grade(), Equals, asserts.ModelSecured)
+	assertstest.AddMany(s.StoreSigning, s.Brands.AccountsAndKeys("my-brand")...)
+
+	const srcLabel = "20260923"
+	s.writeSeedEnforcingValidationSets(c, srcLabel, model)
+
+	// reading side: options.yaml is not trusted at face value on a
+	// secured model, but comp2 is independently re-verified against the
+	// validation-set assertion stored in the seed, so it must still show
+	// up as part of component-test.
+	seed20, err := seed.Open(s.SeedDir, srcLabel)
+	c.Assert(err, IsNil)
+	c.Assert(seed20.LoadAssertions(s.db, s.commitTo), IsNil)
+	c.Assert(seed20.LoadMeta(seed.AllModes, nil, s.perfTimings), IsNil)
+
+	var compSnap *seed.Snap
+	c.Assert(seed20.Iter(func(sn *seed.Snap) error {
+		if sn.SnapName() == "component-test" {
+			compSnap = sn
+		}
+		return nil
+	}), IsNil)
+	c.Assert(compSnap, NotNil)
+
+	gotComps := make(map[string]snap.Revision)
+	for _, comp := range compSnap.Components {
+		gotComps[comp.CompSideInfo.Component.ComponentName] = comp.CompSideInfo.Revision
+	}
+	c.Check(gotComps, DeepEquals, map[string]snap.Revision{
+		"comp1": snap.R(22),
+		"comp2": snap.R(33),
+	})
+
+	// seed-copy side: the same component must be *allowed* to be copied
+	// to a new seed, exercising shouldCopyComponent's analogous
+	// relaxation -- but, like any other optional container, only when
+	// explicitly requested via OptionalContainers. Being backed by a
+	// validation-set makes it legitimate, it does not force inclusion.
+	copier, ok := seed20.(seed.Copier)
+	c.Assert(ok, Equals, true)
+
+	requestedDestDir := c.MkDir()
+	err = copier.Copy(requestedDestDir, seed.CopyOptions{
+		Label: srcLabel,
+		OptionalContainers: &seed.OptionalContainers{
+			Snaps:      []string{"component-test"},
+			Components: map[string][]string{"component-test": {"comp2"}},
+		},
+	}, s.perfTimings)
+	c.Assert(err, IsNil)
+
+	// comp1 is declared by the model, so it lands in the top-level
+	// asserted snaps dir; comp2 is only required by the validation-set,
+	// not declared by the model, so -- like any other asserted-but-
+	// non-model container -- it lands under the destination system's
+	// own local snaps dir instead.
+	c.Check(filepath.Join(requestedDestDir, "snaps", "component-test+comp1_22.comp"), testutil.FilePresent)
+	c.Check(filepath.Join(requestedDestDir, "systems", srcLabel, "snaps", "component-test+comp2_33.comp"), testutil.FilePresent)
+
+	// without an explicit request for comp2, it must not be copied, even
+	// though it would be allowed to be: legitimacy via the validation-set
+	// doesn't bypass the caller's own opt-in list.
+	notRequestedDestDir := c.MkDir()
+	err = copier.Copy(notRequestedDestDir, seed.CopyOptions{
+		Label:              srcLabel,
+		OptionalContainers: &seed.OptionalContainers{Snaps: []string{"component-test"}},
+	}, s.perfTimings)
+	c.Assert(err, IsNil)
+
+	c.Check(filepath.Join(notRequestedDestDir, "snaps", "component-test+comp1_22.comp"), testutil.FilePresent)
+	c.Check(filepath.Join(notRequestedDestDir, "systems", srcLabel, "snaps", "component-test+comp2_33.comp"), testutil.FileAbsent)
+}
+
+// TestSeedOptionsComponentNotRequiredByModelValidationSetsRejected is a
+// guard test: a component listed in options.yaml for a non-dangerous model
+// must be rejected unless it's required by a validation-set the model
+// itself references. It is not enough for some validation-set assertion
+// requiring it to exist in the assertion database passed to
+// LoadAssertions -- that database is not necessarily scoped to this seed
+// alone (e.g. first-boot seeding hands it the whole device assertion
+// database), so it can hold a validation-set assertion left over from
+// elsewhere that this model was never actually built to enforce.
+func (s *seed20Suite) TestSeedOptionsComponentNotRequiredByModelValidationSetsRejected(c *C) {
+	s.makeSnap(c, "snapd", "")
+	s.makeSnap(c, "core20", "")
+	s.makeSnap(c, "pc-kernel=20", "")
+	s.makeSnap(c, "pc=20", "")
+
+	assertCompRevs := map[string]snap.Revision{
+		"comp1": snap.R(22),
+		"comp2": snap.R(33),
+		"comp3": snap.R(44),
+	}
+	s.MakeAssertedSnapWithComps(c,
+		seedtest.SampleSnapYaml["component-test"], nil,
+		snap.R(11), assertCompRevs, "canonical", s.StoreSigning.Database,
+	)
+
+	// a validation-set that would require comp2 for component-test, but
+	// which the model below will never reference at all. Adding it
+	// directly to s.db (rather than via this seed's own writer/
+	// assertions files) simulates it already being present in a shared,
+	// broader assertion database -- e.g. left over from a previous
+	// remodel, or fetched via "snap validate" in monitor mode -- before
+	// this seed's own assertions get merged in.
+	strayValSet, err := s.StoreSigning.Sign(asserts.ValidationSetType, map[string]any{
+		"type":         "validation-set",
+		"authority-id": "canonical",
+		"series":       "16",
+		"account-id":   "canonical",
+		"name":         "stray-set",
+		"sequence":     "1",
+		"snaps": []any{
+			map[string]any{
+				"name":     "component-test",
+				"id":       s.AssertedSnapID("component-test"),
+				"presence": "required",
+				"revision": "11",
+				"components": map[string]any{
+					"comp2": map[string]any{"presence": "required", "revision": "33"},
+				},
+			},
+		},
+		"timestamp": time.Now().UTC().Format(time.RFC3339),
+	}, nil, "")
+	c.Assert(err, IsNil)
+	c.Assert(s.StoreSigning.Add(strayValSet), IsNil)
+	assertstest.AddMany(s.db, s.StoreSigning.StoreAccountKey(""))
+	c.Assert(s.db.Add(strayValSet), IsNil)
+
+	const srcLabel = "20260924"
+	model := s.MakeSeed(c, srcLabel, "my-brand", "my-model", map[string]any{
+		"display-name": "my model",
+		"architecture": "amd64",
+		"base":         "core20",
+		"grade":        "secured",
+		"snaps": []any{
+			map[string]any{
+				"name":            "pc-kernel",
+				"id":              s.AssertedSnapID("pc-kernel"),
+				"type":            "kernel",
+				"default-channel": "20",
+			},
+			map[string]any{
+				"name":            "pc",
+				"id":              s.AssertedSnapID("pc"),
+				"type":            "gadget",
+				"default-channel": "20",
+			},
+			map[string]any{
+				"name":     "component-test",
+				"id":       s.AssertedSnapID("component-test"),
+				"presence": "required",
+				"components": map[string]any{
+					"comp1": "required",
+				},
+			},
+		},
+		// deliberately no "validation-sets" stanza at all: this model
+		// does not reference stray-set, or any validation-set.
+	}, nil)
+	c.Assert(model.Grade(), Equals, asserts.ModelSecured)
+
+	// tamper with the written seed: add comp2 to options.yaml, as if
+	// something (an attacker, or a bug elsewhere) put it there. Nothing
+	// about the model or the written seed otherwise justifies it.
+	optionsFn := filepath.Join(s.SeedDir, "systems", srcLabel, "options.yaml")
+	tampered := internal.Options20{
+		Snaps: []*internal.Snap20{
+			{
+				Name:   naming.SnapName("component-test"),
+				SnapID: s.AssertedSnapID("component-test"),
+				Components: []internal.Component20{
+					{Name: "comp2"},
+				},
+			},
+		},
+	}
+	c.Assert(tampered.Write(optionsFn), IsNil)
+
+	seed20, err := seed.Open(s.SeedDir, srcLabel)
+	c.Assert(err, IsNil)
+	c.Assert(seed20.LoadAssertions(s.db, s.commitTo), IsNil)
+
+	err = seed20.LoadMeta(seed.AllModes, nil, s.perfTimings)
+	c.Check(err, ErrorMatches, `system options.yaml lists component "comp2" for snap "component-test", which is neither declared by the model nor required by an enforced validation-set, unexpected for grade secured`)
+}
+
+// TestSeedOptionsBareNonModelSnapRejected is a guard test: an options.yaml
+// entry for a snap outside the model must be rejected on a non-dangerous
+// grade even when it lists no channel override, no unasserted path, and no
+// components at all -- checkNonDangerousOptions must not skip the
+// model-membership check just because there's nothing else on the entry
+// to validate, since such an entry still gets queued as an extra snap to
+// load by LoadMeta.
+func (s *seed20Suite) TestSeedOptionsBareNonModelSnapRejected(c *C) {
+	s.makeSnap(c, "snapd", "")
+	s.makeSnap(c, "core20", "")
+	s.makeSnap(c, "pc-kernel=20", "")
+	s.makeSnap(c, "pc=20", "")
+	s.makeSnap(c, "optional20-a", "")
+
+	const srcLabel = "20260925"
+	model := s.MakeSeed(c, srcLabel, "my-brand", "my-model", map[string]any{
+		"display-name": "my model",
+		"architecture": "amd64",
+		"base":         "core20",
+		"grade":        "secured",
+		"snaps": []any{
+			map[string]any{
+				"name":            "pc-kernel",
+				"id":              s.AssertedSnapID("pc-kernel"),
+				"type":            "kernel",
+				"default-channel": "20",
+			},
+			map[string]any{
+				"name":            "pc",
+				"id":              s.AssertedSnapID("pc"),
+				"type":            "gadget",
+				"default-channel": "20",
+			},
+		},
+		// optional20-a is deliberately not part of the model at all.
+	}, nil)
+	c.Assert(model.Grade(), Equals, asserts.ModelSecured)
+
+	// tamper with the written seed: add a bare entry -- no channel
+	// override, no unasserted path, no components -- for a snap that
+	// isn't part of the model at all.
+	optionsFn := filepath.Join(s.SeedDir, "systems", srcLabel, "options.yaml")
+	tampered := internal.Options20{
+		Snaps: []*internal.Snap20{
+			{
+				Name:   naming.SnapName("optional20-a"),
+				SnapID: s.AssertedSnapID("optional20-a"),
+			},
+		},
+	}
+	c.Assert(tampered.Write(optionsFn), IsNil)
+
+	seed20, err := seed.Open(s.SeedDir, srcLabel)
+	c.Assert(err, IsNil)
+	c.Assert(seed20.LoadAssertions(s.db, s.commitTo), IsNil)
+
+	err = seed20.LoadMeta(seed.AllModes, nil, s.perfTimings)
+	c.Check(err, ErrorMatches, `system options.yaml has unexpected non-model snap for grade secured: snap "optional20-a"`)
+}
+
+// writeSeedEnforcingValidationSets writes a seed like
+// seedtest.TestingSeed20.MakeSeedWithModel, but with EnforceValidation set,
+// which that helper doesn't expose. Kept minimal: no local snaps, no
+// --comp overrides, since this is only meant to exercise the
+// validation-set-only component path.
+func (s *seed20Suite) writeSeedEnforcingValidationSets(c *C, label string, model *asserts.Model) {
+	db, err := asserts.OpenDatabase(&asserts.DatabaseConfig{
+		Backstore: asserts.NewMemoryBackstore(),
+		Trusted:   s.StoreSigning.Trusted,
+	})
+	c.Assert(err, IsNil)
+
+	retrieve := func(ref *asserts.Ref) (asserts.Assertion, error) {
+		return ref.Resolve(s.StoreSigning.Find)
+	}
+	retrieveSeq := func(seq *asserts.AtSequence) (asserts.Assertion, error) {
+		if seq.Sequence <= 0 {
+			hdrs, err := asserts.HeadersFromSequenceKey(seq.Type, seq.SequenceKey)
+			if err != nil {
+				return nil, err
+			}
+			return s.StoreSigning.FindSequence(seq.Type, hdrs, -1, seq.Type.MaxSupportedFormat())
+		}
+		return seq.Resolve(s.StoreSigning.Find)
+	}
+	newFetcher := func(save func(asserts.Assertion) error) asserts.Fetcher {
+		save2 := func(a asserts.Assertion) error {
+			if err := db.Add(a); err != nil {
+				if _, ok := err.(*asserts.RevisionError); ok {
+					return nil
+				}
+				return err
+			}
+			return save(a)
+		}
+		return asserts.NewSequenceFormingFetcher(db, retrieve, retrieveSeq, save2)
+	}
+	sf := seedwriter.MakeSeedAssertionFetcher(newFetcher)
+
+	opts := seedwriter.Options{
+		SeedDir:           s.SeedDir,
+		Label:             label,
+		EnforceValidation: true,
+	}
+	w, err := seedwriter.New(model, &opts)
+	c.Assert(err, IsNil)
+
+	c.Assert(w.SetOptionsSnaps(nil), IsNil)
+	c.Assert(w.Start(db, sf), IsNil)
+
+	localSnaps, err := w.LocalSnaps()
+	c.Assert(err, IsNil)
+	c.Assert(localSnaps, HasLen, 0)
+
+	c.Assert(w.InfoDerived(), IsNil)
+
+	fetchAsserts := func(sn, _, _ *seedwriter.SeedSnap) ([]*asserts.Ref, error) {
+		prev := len(sf.Refs())
+		if err := sf.Save(s.AssertedSnapRevision(sn.SnapName().String())); err != nil {
+			return nil, err
+		}
+
+		seededResources := make(map[string]bool)
+		for _, comp := range sn.Components {
+			seededResources[comp.ComponentName] = true
+		}
+		for _, resRev := range s.AssertedResourceRevision(sn.SnapName().String()) {
+			if !seededResources[resRev.ResourceName()] {
+				continue
+			}
+			if err := sf.Save(resRev); err != nil {
+				return nil, err
+			}
+		}
+		for _, resPair := range s.AssertedResourcePair(sn.SnapName().String()) {
+			if !seededResources[resPair.ResourceName()] {
+				continue
+			}
+			if err := sf.Save(resPair); err != nil {
+				return nil, err
+			}
+		}
+
+		return sf.Refs()[prev:], nil
+	}
+
+	for {
+		snaps, err := w.SnapsToDownload()
+		c.Assert(err, IsNil)
+
+		for _, sn := range snaps {
+			name := sn.SnapName().String()
+			info := s.AssertedSnapInfo(name)
+			c.Assert(info, NotNil, Commentf("no snap info for %q", name))
+
+			cinfos := s.AssertedComponentInfos(name)
+			seedComps := make(map[string]*seedwriter.SeedComponent, len(sn.Components))
+			for _, cc := range sn.Components {
+				comp := cc
+				found := false
+				for _, ci := range cinfos {
+					if ci.Component.ComponentName == comp.ComponentName {
+						comp.Info = ci
+						found = true
+						break
+					}
+				}
+				c.Assert(found, Equals, true)
+				seedComps[comp.ComponentName] = &comp
+			}
+			c.Assert(w.SetInfo(sn, info, seedComps), IsNil)
+
+			if _, err := os.Stat(sn.Path); err == nil {
+				continue
+			}
+			c.Assert(os.Rename(s.AssertedSnap(name), sn.Path), IsNil)
+			for _, comp := range sn.Components {
+				c.Assert(os.Rename(s.AssertedSnap(comp.String()), comp.Path), IsNil)
+			}
+		}
+
+		complete, err := w.Downloaded(fetchAsserts)
+		c.Assert(err, IsNil)
+		if complete {
+			break
+		}
+	}
+
+	c.Assert(w.CheckValidationSets(), IsNil)
+
+	copySnap := func(name, src, dst string) error {
+		return osutil.CopyFile(src, dst, 0)
+	}
+	c.Assert(w.SeedSnaps(copySnap), IsNil)
+	c.Assert(w.WriteMeta(), IsNil)
+}
+
 func (s *seed20Suite) TestLoadMetaCore20WithIntegrityData(c *C) {
 	asid := []asserts.IntegrityData{
 		{
